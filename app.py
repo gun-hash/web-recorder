@@ -1,10 +1,11 @@
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory, g
 import asyncio
 from recorder import record_website
 import uuid
 import os
+import sqlite3
 from pathlib import Path
-from asgiref.wsgi import WsgiToAsgi  # Import the adapter
+from asgiref.wsgi import WsgiToAsgi
 
 app = Flask(__name__)
 
@@ -13,42 +14,80 @@ VIDEOS_DIR = Path("videos")
 VIDEOS_DIR.mkdir(exist_ok=True)
 app.config['STATIC_FOLDER'] = str(VIDEOS_DIR)
 
+# Database configuration
+DATABASE = 'recordings.db'
+
 # Create a queue for video recording tasks
 recording_queue = asyncio.Queue()
-# Track active recordings
-current_recordings = {}
+
+def get_db():
+    db = sqlite3.connect(DATABASE)
+    db.row_factory = sqlite3.Row
+    return db
+
+def init_db():
+    with app.app_context():
+        db = get_db()
+        with open('schema.sql', 'r') as f:
+            db.executescript(f.read())
+        db.commit()
+
+def update_recording_status(request_id, status, video_url=None, error=None):
+    db = get_db()
+    try:
+        db.execute(
+            'INSERT OR REPLACE INTO recordings (request_id, status, video_url, error) VALUES (?, ?, ?, ?)',
+            (request_id, status, video_url, error)
+        )
+        db.commit()
+    finally:
+        db.close()
+
+def get_recording_status(request_id):
+    db = get_db()
+    try:
+        result = db.execute('SELECT * FROM recordings WHERE request_id = ?', (request_id,)).fetchone()
+        if result:
+            return dict(result)
+        return None
+    finally:
+        db.close()
 
 async def process_recording_queue():
     """Background task to process the recording queue"""
     print("Queue processor started!")
     while True:
         try:
-            # Get the next recording task from the queue
+            print("Waiting for tasks...")
             task_data = await recording_queue.get()
             request_id = task_data['request_id']
             url = task_data['url']
             
+            print(f"Processing request ID: {request_id} for URL: {url}")
+            
             try:
-                # Record the website
                 video_path = await record_website(url, request_id)
-                # Store the result
-                current_recordings[request_id] = {
-                    'status': 'completed',
-                    'video_url': f'videos/{request_id}/{os.path.basename(video_path)}',
-                    'error': None
-                }
+                print(f"Recording completed: {video_path}")
+                with app.app_context():
+                    update_recording_status(
+                        request_id,
+                        'completed',
+                        f'videos/{request_id}/{os.path.basename(video_path)}'
+                    )
             except Exception as e:
-                current_recordings[request_id] = {
-                    'status': 'failed',
-                    'video_url': None,
-                    'error': str(e)
-                }
+                print(f"Error recording website: {e}")
+                with app.app_context():
+                    update_recording_status(
+                        request_id,
+                        'failed',
+                        error=str(e)
+                    )
             finally:
                 recording_queue.task_done()
                 
         except Exception as e:
             print(f"Error processing queue: {e}")
-            await asyncio.sleep(1)  # Prevent tight loop on persistent errors
+            await asyncio.sleep(1)
 
 @app.route('/record', methods=['POST'])
 async def record():
@@ -64,8 +103,10 @@ async def record():
         url = data['url']
         request_id = str(uuid.uuid4())
         
+        # Initialize recording status in database
+        update_recording_status(request_id, 'queued')
+        
         # Add recording task to queue
-        current_recordings[request_id] = {'status': 'queued', 'video_url': None, 'error': None}
         await recording_queue.put({'request_id': request_id, 'url': url})
         
         return jsonify({
@@ -81,10 +122,10 @@ async def record():
 @app.route('/status/<request_id>', methods=['GET'])
 async def get_status(request_id):
     """Check the status of a recording request"""
-    if request_id not in current_recordings:
+    recording_status = get_recording_status(request_id)
+    if not recording_status:
         return jsonify({'error': 'Request ID not found'}), 404
     
-    recording_status = current_recordings[request_id]
     response = {
         'status': recording_status['status'],
         'request_id': request_id,
@@ -107,6 +148,9 @@ if __name__ == '__main__':
     # Create event loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    
+    # Initialize the database
+    init_db()
     
     # Wrap the Flask app with WsgiToAsgi
     asgi_app = WsgiToAsgi(app)

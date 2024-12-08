@@ -27,11 +27,11 @@ async def record_website(url, video_id):
                             wait_until="domcontentloaded")  # Wait until domcontentloaded
             
             # Wait for any animations or dynamic content to load
-            await page.wait_for_timeout(5000)  # Wait additional 5 seconds
+            await page.wait_for_timeout(1000)  # Wait additional 1 second
             
             # Scroll the page in increments
             scroll_increment = 100
-            scroll_pause = 500  # milliseconds
+            scroll_pause = 100  # milliseconds
             page_height = await page.evaluate("document.body.scrollHeight")
             
             for position in range(0, page_height, scroll_increment):
